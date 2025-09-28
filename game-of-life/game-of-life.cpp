@@ -17,7 +17,7 @@ const int GRID_W = WIN_W;
 const int GRID_H = WIN_H;
 
 // Number of species (5..10 typical)
-const int NUM_SPECIES = 10; // change at runtime if you want
+const int NUM_SPECIES = 5;
 
 // Colors for species (RGB each 0-255) - index 0 reserved for dead
 const uint8_t SPECIES_COLORS[11][3] = {
@@ -122,17 +122,31 @@ void worker_thread_func(int id, int y0, int y1) {
 }
 
 // Convert the species grid to RGB pixels (done by main thread)
-void grid_to_pixels() {
-  for (int y = 0; y < GRID_H; ++y) {
-    for (int x = 0; x < GRID_W; ++x) {
-      uint8_t s = grid_cur[idx(x, y)];
-      const uint8_t* c = SPECIES_COLORS[s];
-      int p = (y * GRID_W + x) * 3;
-      pixels[p + 0] = c[0];
-      pixels[p + 1] = c[1];
-      pixels[p + 2] = c[2];
+void grid_to_pixels_parallel() {
+  int num_threads = num_worker_threads;
+  std::vector<std::thread> threads;
+  int rows_per_thread = GRID_H / num_threads;
+
+  auto worker = [](int y0, int y1) {
+    for (int y = y0; y < y1; ++y) {
+      for (int x = 0; x < GRID_W; ++x) {
+        uint8_t s = grid_cur[idx(x, y)];
+        const uint8_t* c = SPECIES_COLORS[s];
+        int p = (y * GRID_W + x) * 3;
+        pixels[p + 0] = c[0];
+        pixels[p + 1] = c[1];
+        pixels[p + 2] = c[2];
+      }
     }
+    };
+
+  threads.reserve(num_threads);
+  for (int i = 0; i < num_threads; ++i) {
+    int y0 = i * rows_per_thread;
+    int y1 = (i == num_threads - 1) ? GRID_H : (y0 + rows_per_thread);
+    threads.emplace_back(worker, y0, y1);
   }
+  for (auto& t : threads) t.join();
 }
 
 // Tiny vertex & fragment shader to draw textured quad
@@ -181,7 +195,7 @@ int main() {
   GLFWwindow* window = glfwCreateWindow(WIN_W, WIN_H, "Multi-Species Game of Life", NULL, NULL);
   if (!window) { glfwTerminate(); return -1; }
   glfwMakeContextCurrent(window);
-  glfwSwapInterval(2);
+  glfwSwapInterval(1);
 
   if (glewInit() != GLEW_OK) {
     std::cerr << "GLEW init failed\n";
@@ -256,6 +270,8 @@ int main() {
 
   while (!glfwWindowShouldClose(window)) {
 
+    auto start =  std::chrono::high_resolution_clock::now();
+
     // signal workers to start computing next generation
     {
       std::unique_lock<std::mutex> lk(mtx);
@@ -270,11 +286,16 @@ int main() {
       cv_workers_done.wait(lk, [] { return workers_remaining == 0; });
     }
 
+		auto end = std::chrono::high_resolution_clock::now();
+
+		std::chrono::duration<double, std::milli> elapsed = end - start;
+		std::cout << "Frame time: " << elapsed.count() << " ms\n";
+
     // swap buffers (producer-consumer double buffer)
     grid_cur.swap(grid_next);
 
     // Convert to pixels (colors) and upload texture
-    grid_to_pixels();
+    grid_to_pixels_parallel();
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, GRID_W, GRID_H, GL_RGB, GL_UNSIGNED_BYTE, pixels.data());
 
