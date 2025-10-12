@@ -42,6 +42,7 @@ std::vector<uint8_t> grid_cur(GRID_W* GRID_H);   // species id per cell
 std::vector<uint8_t> grid_next(GRID_W* GRID_H);  // next generation
 std::vector<uint8_t> pixels_curr(GRID_W* GRID_H * 3); // RGB pixel buffer for texture
 std::vector<uint8_t> pixels_next(GRID_W* GRID_H * 3); // RGB pixel buffer for texture
+std::vector<std::vector<uint8_t>> neighbor_counts(NUM_SPECIES + 1); // per-species neighbor counts
 
 // Thread sync
 int num_worker_threads = std::max(1u, std::thread::hardware_concurrency() - 2);
@@ -52,27 +53,27 @@ std::condition_variable cv_start_step;
 bool start_step = false;
 bool stop_all = false;
 
-// Count live neighbors for a particular species (wrap-around not used; use bounded grid)
-inline int count_neighbors_for_species(const std::vector<uint8_t>& grid, int x, int y, uint8_t species) noexcept {
-  int count = 0;
-  const int y_min = (y > 0) ? y - 1 : 0;
-  const int y_max = (y < GRID_H - 1) ? y + 1 : GRID_H - 1;
-  const int x_min = (x > 0) ? x - 1 : 0;
-  const int x_max = (x < GRID_W - 1) ? x + 1 : GRID_W - 1;
-  const int row_stride = GRID_W;
+// Precompute neighbor counts for all species
+void compute_all_neighbor_counts(const std::vector<uint8_t>& grid) {
+  for (uint8_t s = 1; s <= NUM_SPECIES; ++s) {
+    auto& nc = neighbor_counts[s];
+    nc.assign(GRID_W * GRID_H, 0);
 
-  const int base = y * row_stride;
-
-  for (int yy = y_min; yy <= y_max; ++yy) {
-    const int row = yy * row_stride;
-    for (int xx = x_min; xx <= x_max; ++xx) {
-      int i = row + xx;
-      count += (i != base + x && grid[i] == species);
+    for (int y = 0; y < GRID_H; ++y) {
+      int row = y * GRID_W;
+      for (int x = 0; x < GRID_W; ++x) {
+        if (grid[row + x] != s) continue;
+        for (int yy = std::max(0, y - 1); yy <= std::min(GRID_H - 1, y + 1); ++yy) {
+          int row2 = yy * GRID_W;
+          for (int xx = std::max(0, x - 1); xx <= std::min(GRID_W - 1, x + 1); ++xx) {
+            if (xx == x && yy == y) continue;
+            ++nc[row2 + xx];
+          }
+        }
+      }
     }
   }
-  return count;
 }
-
 
 // Worker thread function: handles rows [y0, y1)
 void worker_thread_func(int id, int y0, int y1) {
@@ -93,7 +94,7 @@ void worker_thread_func(int id, int y0, int y1) {
 				int index = idx(x, y);
 
         for (uint8_t s = 1; s <= NUM_SPECIES; ++s) {
-          int neighbors = count_neighbors_for_species(grid_cur, x, y, s);
+          int neighbors = neighbor_counts[s][index];
           uint8_t cur = grid_cur[index];
           bool cur_alive = (cur == s);
           bool next_alive = false;
@@ -269,6 +270,9 @@ int main() {
   while (!glfwWindowShouldClose(window)) {
 
     auto start =  std::chrono::high_resolution_clock::now();
+
+		// Precompute neighbor counts for all species
+		compute_all_neighbor_counts(grid_cur);
 
     // signal workers to start computing next generation
     {
