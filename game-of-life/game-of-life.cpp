@@ -44,7 +44,7 @@ std::vector<uint8_t> pixels_curr(GRID_W* GRID_H * 3); // RGB pixel buffer for te
 std::vector<uint8_t> pixels_next(GRID_W* GRID_H * 3); // RGB pixel buffer for texture
 
 // Thread sync
-int num_worker_threads = std::max(1u, std::thread::hardware_concurrency() - 1);
+int num_worker_threads = std::max(1u, std::thread::hardware_concurrency() - 2);
 std::atomic<int> workers_remaining{ 0 };
 std::mutex mtx;
 std::condition_variable cv_workers_done;
@@ -53,16 +53,26 @@ bool start_step = false;
 bool stop_all = false;
 
 // Count live neighbors for a particular species (wrap-around not used; use bounded grid)
-inline int count_neighbors_for_species(const std::vector<uint8_t>& grid, int x, int y, uint8_t species) {
+inline int count_neighbors_for_species(const std::vector<uint8_t>& grid, int x, int y, uint8_t species) noexcept {
   int count = 0;
-  for (int yy = std::max(0, y - 1); yy <= std::min(GRID_H - 1, y + 1); ++yy) {
-    for (int xx = std::max(0, x - 1); xx <= std::min(GRID_W - 1, x + 1); ++xx) {
-      if (xx == x && yy == y) continue;
-      if (grid[idx(xx, yy)] == species) ++count;
+  const int y_min = (y > 0) ? y - 1 : 0;
+  const int y_max = (y < GRID_H - 1) ? y + 1 : GRID_H - 1;
+  const int x_min = (x > 0) ? x - 1 : 0;
+  const int x_max = (x < GRID_W - 1) ? x + 1 : GRID_W - 1;
+  const int row_stride = GRID_W;
+
+  const int base = y * row_stride;
+
+  for (int yy = y_min; yy <= y_max; ++yy) {
+    const int row = yy * row_stride;
+    for (int xx = x_min; xx <= x_max; ++xx) {
+      int i = row + xx;
+      count += (i != base + x && grid[i] == species);
     }
   }
   return count;
 }
+
 
 // Worker thread function: handles rows [y0, y1)
 void worker_thread_func(int id, int y0, int y1) {
@@ -77,13 +87,14 @@ void worker_thread_func(int id, int y0, int y1) {
     // Compute assigned rows
     for (int y = y0; y < y1; ++y) {
       for (int x = 0; x < GRID_W; ++x) {
-        // choose species with most live neighbors that results in alive state.
+        // choose species with most live neighbors that results in alive state
         uint8_t final_species = 0; // dead by default
         int best_score = -1000;
+				int index = idx(x, y);
 
         for (uint8_t s = 1; s <= NUM_SPECIES; ++s) {
           int neighbors = count_neighbors_for_species(grid_cur, x, y, s);
-          uint8_t cur = grid_cur[idx(x, y)];
+          uint8_t cur = grid_cur[index];
           bool cur_alive = (cur == s);
           bool next_alive = false;
           // Apply standard Game of Life rules per species
@@ -107,15 +118,18 @@ void worker_thread_func(int id, int y0, int y1) {
           }
         } // end species loop
 
-        grid_next[idx(x, y)] = final_species;
-				pixels_next[idx(x, y) * 3 + 0] = SPECIES_COLORS[final_species][0];
-        pixels_next[idx(x, y) * 3 + 1] = SPECIES_COLORS[final_species][1];
-        pixels_next[idx(x, y) * 3 + 2] = SPECIES_COLORS[final_species][2];
+        grid_next[index] = final_species;
+				// SIMD-friendly pixel assignment
+				const uint8_t* color = SPECIES_COLORS[final_species];
+				uint8_t* dst = &pixels_next[index * 3];
+				dst[0] = color[0];
+        dst[1] = color[1];
+        dst[2] = color[2];
        }
     }
 
     // Signal completion for this worker
-    if (--workers_remaining == 0) {
+    if (workers_remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
       std::unique_lock<std::mutex> lk(mtx);
       start_step = false; // reset
       cv_workers_done.notify_one();
@@ -172,7 +186,7 @@ int main() {
   GLFWwindow* window = glfwCreateWindow(WIN_W, WIN_H, "Multi-Species Game of Life", NULL, NULL);
   if (!window) { glfwTerminate(); return -1; }
   glfwMakeContextCurrent(window);
-  glfwSwapInterval(1);
+  glfwSwapInterval(0);
 
   if (glewInit() != GLEW_OK) {
     std::cerr << "GLEW init failed\n";
@@ -251,6 +265,7 @@ int main() {
     workers.emplace_back(worker_thread_func, i, y0, y1);
   }
 
+  // Main loop of the application
   while (!glfwWindowShouldClose(window)) {
 
     auto start =  std::chrono::high_resolution_clock::now();
@@ -290,7 +305,6 @@ int main() {
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex);
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
-    glBindVertexArray(0);
 
     glfwSwapBuffers(window);
     glfwPollEvents();
