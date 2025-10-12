@@ -40,10 +40,11 @@ inline int idx(int x, int y) { return y * GRID_W + x; }
 // Shared state
 std::vector<uint8_t> grid_cur(GRID_W* GRID_H);   // species id per cell
 std::vector<uint8_t> grid_next(GRID_W* GRID_H);  // next generation
-std::vector<uint8_t> pixels(GRID_W* GRID_H * 3); // RGB pixel buffer for texture
+std::vector<uint8_t> pixels_curr(GRID_W* GRID_H * 3); // RGB pixel buffer for texture
+std::vector<uint8_t> pixels_next(GRID_W* GRID_H * 3); // RGB pixel buffer for texture
 
 // Thread sync
-int num_worker_threads = std::max(1u, std::thread::hardware_concurrency() - 2);
+int num_worker_threads = std::max(1u, std::thread::hardware_concurrency() - 1);
 std::atomic<int> workers_remaining{ 0 };
 std::mutex mtx;
 std::condition_variable cv_workers_done;
@@ -98,7 +99,7 @@ void worker_thread_func(int id, int y0, int y1) {
           if (next_alive) {
             // Candidate species to occupy this cell.
             // Use neighbors as tie-breaker (more neighbors wins). If equal, smaller species id wins.
-            int score = neighbors * 10 - s; // deterministic
+            int score = neighbors * 10 - s; // deterministic maybe change this for tbb
             if (score > best_score) {
               best_score = score;
               final_species = s;
@@ -107,7 +108,10 @@ void worker_thread_func(int id, int y0, int y1) {
         } // end species loop
 
         grid_next[idx(x, y)] = final_species;
-      }
+				pixels_next[idx(x, y) * 3 + 0] = SPECIES_COLORS[final_species][0];
+        pixels_next[idx(x, y) * 3 + 1] = SPECIES_COLORS[final_species][1];
+        pixels_next[idx(x, y) * 3 + 2] = SPECIES_COLORS[final_species][2];
+       }
     }
 
     // Signal completion for this worker
@@ -119,34 +123,6 @@ void worker_thread_func(int id, int y0, int y1) {
 
     // Wait here for next start (loop continues)
   }
-}
-
-// Convert the species grid to RGB pixels (done by main thread)
-void grid_to_pixels_parallel() {
-  int num_threads = num_worker_threads;
-  std::vector<std::thread> threads;
-  int rows_per_thread = GRID_H / num_threads;
-
-  auto worker = [](int y0, int y1) {
-    for (int y = y0; y < y1; ++y) {
-      for (int x = 0; x < GRID_W; ++x) {
-        uint8_t s = grid_cur[idx(x, y)];
-        const uint8_t* c = SPECIES_COLORS[s];
-        int p = (y * GRID_W + x) * 3;
-        pixels[p + 0] = c[0];
-        pixels[p + 1] = c[1];
-        pixels[p + 2] = c[2];
-      }
-    }
-    };
-
-  threads.reserve(num_threads);
-  for (int i = 0; i < num_threads; ++i) {
-    int y0 = i * rows_per_thread;
-    int y1 = (i == num_threads - 1) ? GRID_H : (y0 + rows_per_thread);
-    threads.emplace_back(worker, y0, y1);
-  }
-  for (auto& t : threads) t.join();
 }
 
 // Tiny vertex & fragment shader to draw textured quad
@@ -190,6 +166,7 @@ int main() {
   glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
   glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
   glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+  glfwWindowHint(GLFW_DOUBLEBUFFER, GLFW_TRUE);
 
   // Window setup
   GLFWwindow* window = glfwCreateWindow(WIN_W, WIN_H, "Multi-Species Game of Life", NULL, NULL);
@@ -254,9 +231,15 @@ int main() {
   // Initialize grid randomly
   std::mt19937 rng((unsigned)std::chrono::steady_clock::now().time_since_epoch().count());
   std::uniform_int_distribution<int> d(0, NUM_SPECIES);
-  for (int y = 0; y < GRID_H; ++y)
-    for (int x = 0; x < GRID_W; ++x)
-      grid_cur[idx(x, y)] = (uint8_t)d(rng);
+  for (int y = 0; y < GRID_H; ++y) {
+   for (int x = 0; x < GRID_W; ++x) {
+        grid_cur[idx(x, y)] = (uint8_t)d(rng);
+			  uint8_t s = grid_cur[idx(x, y)];
+        pixels_curr[idx(x, y) * 3 + 0] = SPECIES_COLORS[s][0];
+        pixels_curr[idx(x, y) * 3 + 1] = SPECIES_COLORS[s][1];
+			  pixels_curr[idx(x, y) * 3 + 2] = SPECIES_COLORS[s][2];
+   }
+  }
 
   // Launch worker threads
   std::vector<std::thread> workers;
@@ -293,11 +276,11 @@ int main() {
 
     // swap buffers (producer-consumer double buffer)
     grid_cur.swap(grid_next);
+    pixels_curr.swap(pixels_next);
 
     // Convert to pixels (colors) and upload texture
-    grid_to_pixels_parallel();
     glBindTexture(GL_TEXTURE_2D, tex);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, GRID_W, GRID_H, GL_RGB, GL_UNSIGNED_BYTE, pixels.data());
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, GRID_W, GRID_H, GL_RGB, GL_UNSIGNED_BYTE, pixels_curr.data());
 
     // Draw textured quad full-screen
     glClear(GL_COLOR_BUFFER_BIT);
