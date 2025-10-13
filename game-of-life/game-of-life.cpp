@@ -18,7 +18,7 @@ const int GRID_W = WIN_W;
 const int GRID_H = WIN_H;
 
 // Number of species (5..10 typical)
-const int NUM_SPECIES = 5;
+const int NUM_SPECIES = 10;
 
 // Colors for species (RGB each 0-255) - index 0 reserved for dead
 const uint8_t SPECIES_COLORS[11][3] = {
@@ -82,15 +82,22 @@ void compute_all_neighbor_counts_tbb(const std::vector<uint8_t>& grid) {
 
 // Parallel compute of next generation
 void compute_next_generation_tbb() {
+
   tbb::parallel_for(
     tbb::blocked_range2d<int>(0, GRID_H, 32, 0, GRID_W, 64),
     [&](const tbb::blocked_range2d<int>& r) {
+
+      std::mt19937 rng(std::random_device{}());
+
       for (int y = r.rows().begin(); y < r.rows().end(); ++y) {
         for (int x = r.cols().begin(); x < r.cols().end(); ++x) {
           int index = idx(x, y);
           uint8_t final_species = 0;
           int best_score = -1000;
           uint8_t cur = grid_cur[index];
+
+          std::vector<uint8_t> alive_candidates;
+          alive_candidates.reserve(NUM_SPECIES);
 
           for (uint8_t s = 1; s <= NUM_SPECIES; ++s) {
             int neighbors = neighbor_counts[s][index];
@@ -105,13 +112,13 @@ void compute_next_generation_tbb() {
               next_alive = (neighbors == 3);
             }
 
-            if (next_alive) {
-              int score = neighbors * 10 - s;
-              if (score > best_score) {
-                best_score = score;
-                final_species = s;
-              }
-            }
+            if (next_alive)
+              alive_candidates.push_back(s);
+          }
+
+          if (!alive_candidates.empty()) {
+            std::uniform_int_distribution<size_t> dist(0, alive_candidates.size() - 1);
+            final_species = alive_candidates[dist(rng)];
           }
 
           // Write to next grid and pixel buffer
@@ -258,8 +265,8 @@ int main() {
 
     // Limit to 30 FPS
     auto frame_time = end - start;
-    if (frame_time < std::chrono::milliseconds(33)) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(33) - frame_time);
+    if (frame_time < std::chrono::milliseconds(15)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(15) - frame_time);
       end = std::chrono::high_resolution_clock::now();
 		}
 
