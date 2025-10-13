@@ -1,6 +1,5 @@
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
-
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -9,6 +8,8 @@
 #include <random>
 #include <thread>
 #include <vector>
+#include <tbb/parallel_for.h>
+#include <tbb/blocked_range2d.h>
 
 // Window / grid size
 const int WIN_W = 1024;
@@ -44,100 +45,86 @@ std::vector<uint8_t> pixels_curr(GRID_W* GRID_H * 3); // RGB pixel buffer for te
 std::vector<uint8_t> pixels_next(GRID_W* GRID_H * 3); // RGB pixel buffer for texture
 std::vector<std::vector<uint8_t>> neighbor_counts(NUM_SPECIES + 1); // per-species neighbor counts
 
-// Thread sync
-int num_worker_threads = std::max(1u, std::thread::hardware_concurrency() - 2);
-std::atomic<int> workers_remaining{ 0 };
-std::mutex mtx;
-std::condition_variable cv_workers_done;
-std::condition_variable cv_start_step;
-bool start_step = false;
-bool stop_all = false;
 
 // Precompute neighbor counts for all species
-void compute_all_neighbor_counts(const std::vector<uint8_t>& grid) {
+void compute_all_neighbor_counts_tbb(const std::vector<uint8_t>& grid) {
+  for (uint8_t s = 1; s <= NUM_SPECIES; ++s)
+    neighbor_counts[s].assign(GRID_W * GRID_H, 0);
+
+  tbb::task_group tg;
   for (uint8_t s = 1; s <= NUM_SPECIES; ++s) {
-    auto& nc = neighbor_counts[s];
-    nc.assign(GRID_W * GRID_H, 0);
-
-    for (int y = 0; y < GRID_H; ++y) {
-      int row = y * GRID_W;
-      for (int x = 0; x < GRID_W; ++x) {
-        if (grid[row + x] != s) continue;
-        for (int yy = std::max(0, y - 1); yy <= std::min(GRID_H - 1, y + 1); ++yy) {
-          int row2 = yy * GRID_W;
-          for (int xx = std::max(0, x - 1); xx <= std::min(GRID_W - 1, x + 1); ++xx) {
-            if (xx == x && yy == y) continue;
-            ++nc[row2 + xx];
-          }
-        }
-      }
-    }
-  }
-}
-
-// Worker thread function: handles rows [y0, y1)
-void worker_thread_func(int id, int y0, int y1) {
-  while (true) {
-    // Wait for start signal
-    {
-      std::unique_lock<std::mutex> lk(mtx);
-      cv_start_step.wait(lk, [] { return start_step || stop_all; });
-      if (stop_all) return;
-    }
-
-    // Compute assigned rows
-    for (int y = y0; y < y1; ++y) {
-      for (int x = 0; x < GRID_W; ++x) {
-        // choose species with most live neighbors that results in alive state
-        uint8_t final_species = 0; // dead by default
-        int best_score = -1000;
-				int index = idx(x, y);
-
-        for (uint8_t s = 1; s <= NUM_SPECIES; ++s) {
-          int neighbors = neighbor_counts[s][index];
-          uint8_t cur = grid_cur[index];
-          bool cur_alive = (cur == s);
-          bool next_alive = false;
-          // Apply standard Game of Life rules per species
-          if (cur_alive) {
-            if (neighbors < 2) next_alive = false;
-            else if (neighbors == 2 || neighbors == 3) next_alive = true;
-            else next_alive = false;
-          }
-          else {
-            if (neighbors == 3) next_alive = true;
-            else next_alive = false;
-          }
-          if (next_alive) {
-            // Candidate species to occupy this cell.
-            // Use neighbors as tie-breaker (more neighbors wins). If equal, smaller species id wins.
-            int score = neighbors * 10 - s; // deterministic maybe change this for tbb
-            if (score > best_score) {
-              best_score = score;
-              final_species = s;
+    tg.run([&, s] {
+      auto& nc = neighbor_counts[s];
+      tbb::parallel_for(tbb::blocked_range2d<int>(0, GRID_H, 64, 0, GRID_W, 64),
+        [&](const tbb::blocked_range2d<int>& r) {
+          for (int y = r.rows().begin(); y < r.rows().end(); ++y) {
+            int row = y * GRID_W;
+            for (int x = r.cols().begin(); x < r.cols().end(); ++x) {
+              if (grid[row + x] != s) continue;
+              int y0 = std::max(0, y - 1);
+              int y1 = std::min(GRID_H - 1, y + 1);
+              int x0 = std::max(0, x - 1);
+              int x1 = std::min(GRID_W - 1, x + 1);
+              for (int yy = y0; yy <= y1; ++yy) {
+                int row2 = yy * GRID_W;
+                for (int xx = x0; xx <= x1; ++xx) {
+                  if (xx == x && yy == y) continue;
+                  ++nc[row2 + xx];
+                }
+              }
             }
           }
-        } // end species loop
-
-        grid_next[index] = final_species;
-				// SIMD-friendly pixel assignment
-				const uint8_t* color = SPECIES_COLORS[final_species];
-				uint8_t* dst = &pixels_next[index * 3];
-				dst[0] = color[0];
-        dst[1] = color[1];
-        dst[2] = color[2];
-       }
-    }
-
-    // Signal completion for this worker
-    if (workers_remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-      std::unique_lock<std::mutex> lk(mtx);
-      start_step = false; // reset
-      cv_workers_done.notify_one();
-    }
-
-    // Wait here for next start (loop continues)
+        });
+      });
   }
+  tg.wait(); // Wait for all species computations
+}
+
+// Parallel compute of next generation
+void compute_next_generation_tbb() {
+  tbb::parallel_for(
+    tbb::blocked_range2d<int>(0, GRID_H, 32, 0, GRID_W, 64),
+    [&](const tbb::blocked_range2d<int>& r) {
+      for (int y = r.rows().begin(); y < r.rows().end(); ++y) {
+        for (int x = r.cols().begin(); x < r.cols().end(); ++x) {
+          int index = idx(x, y);
+          uint8_t final_species = 0;
+          int best_score = -1000;
+          uint8_t cur = grid_cur[index];
+
+          for (uint8_t s = 1; s <= NUM_SPECIES; ++s) {
+            int neighbors = neighbor_counts[s][index];
+            bool cur_alive = (cur == s);
+            bool next_alive = false;
+
+            // Apply Game of Life rules
+            if (cur_alive) {
+              next_alive = (neighbors == 2 || neighbors == 3);
+            }
+            else {
+              next_alive = (neighbors == 3);
+            }
+
+            if (next_alive) {
+              int score = neighbors * 10 - s;
+              if (score > best_score) {
+                best_score = score;
+                final_species = s;
+              }
+            }
+          }
+
+          // Write to next grid and pixel buffer
+          grid_next[index] = final_species;
+
+          const uint8_t* color = SPECIES_COLORS[final_species];
+          uint8_t* dst = &pixels_next[index * 3];
+          dst[0] = color[0];
+          dst[1] = color[1];
+          dst[2] = color[2];
+        }
+      }
+    });
 }
 
 // Tiny vertex & fragment shader to draw textured quad
@@ -225,10 +212,10 @@ int main() {
   glAttachShader(prog, vs);
   glAttachShader(prog, fs);
   glLinkProgram(prog);
-  GLint ok; 
+  GLint ok;
   glGetProgramiv(prog, GL_LINK_STATUS, &ok);
   if (!ok) {
-    char buf[1024]; 
+    char buf[1024];
     glGetProgramInfoLog(prog, 1024, NULL, buf);
     std::cerr << "Program link error: " << buf << std::endl;
   }
@@ -247,51 +234,37 @@ int main() {
   std::mt19937 rng((unsigned)std::chrono::steady_clock::now().time_since_epoch().count());
   std::uniform_int_distribution<int> d(0, NUM_SPECIES);
   for (int y = 0; y < GRID_H; ++y) {
-   for (int x = 0; x < GRID_W; ++x) {
-        grid_cur[idx(x, y)] = (uint8_t)d(rng);
-			  uint8_t s = grid_cur[idx(x, y)];
-        pixels_curr[idx(x, y) * 3 + 0] = SPECIES_COLORS[s][0];
-        pixels_curr[idx(x, y) * 3 + 1] = SPECIES_COLORS[s][1];
-			  pixels_curr[idx(x, y) * 3 + 2] = SPECIES_COLORS[s][2];
-   }
-  }
-
-  // Launch worker threads
-  std::vector<std::thread> workers;
-  workers.reserve(num_worker_threads);
-  int rows_per_worker = GRID_H / num_worker_threads;
-  for (int i = 0; i < num_worker_threads; ++i) {
-    int y0 = i * rows_per_worker;
-    int y1 = (i == num_worker_threads - 1) ? GRID_H : (y0 + rows_per_worker);
-    workers.emplace_back(worker_thread_func, i, y0, y1);
+    for (int x = 0; x < GRID_W; ++x) {
+      grid_cur[idx(x, y)] = (uint8_t)d(rng);
+      uint8_t s = grid_cur[idx(x, y)];
+      pixels_curr[idx(x, y) * 3 + 0] = SPECIES_COLORS[s][0];
+      pixels_curr[idx(x, y) * 3 + 1] = SPECIES_COLORS[s][1];
+      pixels_curr[idx(x, y) * 3 + 2] = SPECIES_COLORS[s][2];
+    }
   }
 
   // Main loop of the application
   while (!glfwWindowShouldClose(window)) {
 
-    auto start =  std::chrono::high_resolution_clock::now();
+    auto start = std::chrono::high_resolution_clock::now();
 
-		// Precompute neighbor counts for all species
-		compute_all_neighbor_counts(grid_cur);
+    // Precompute neighbor counts for all species
+    compute_all_neighbor_counts_tbb(grid_cur);
 
-    // signal workers to start computing next generation
-    {
-      std::unique_lock<std::mutex> lk(mtx);
-      workers_remaining = num_worker_threads;
-      start_step = true;
-      cv_start_step.notify_all();
-    }
+    // Compute next generation in parallel using TBB
+    compute_next_generation_tbb();
 
-    // Wait for workers to finish
-    {
-      std::unique_lock<std::mutex> lk(mtx);
-      cv_workers_done.wait(lk, [] { return workers_remaining == 0; });
-    }
+    auto end = std::chrono::high_resolution_clock::now();
 
-		auto end = std::chrono::high_resolution_clock::now();
+    // Limit to 30 FPS
+    auto frame_time = end - start;
+    if (frame_time < std::chrono::milliseconds(33)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(33) - frame_time);
+      end = std::chrono::high_resolution_clock::now();
+		}
 
-		std::chrono::duration<double, std::milli> elapsed = end - start;
-		std::cout << "Frame time: " << elapsed.count() << " ms\n";
+    std::chrono::duration<double, std::milli> elapsed = end - start;
+    std::cout << "Frame time : " << elapsed.count() << " ms\n";
 
     // swap buffers (producer-consumer double buffer)
     grid_cur.swap(grid_next);
@@ -314,14 +287,6 @@ int main() {
     glfwPollEvents();
 
   }
-
-  // Shutdown: notify workers to stop and join
-  {
-    std::unique_lock<std::mutex> lk(mtx);
-    stop_all = true;
-    cv_start_step.notify_all();
-  }
-  for (auto& t : workers) if (t.joinable()) t.join();
 
   // Cleanup GL
   glDeleteTextures(1, &tex);
