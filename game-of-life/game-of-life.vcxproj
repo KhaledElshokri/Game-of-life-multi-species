@@ -141,8 +141,8 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>glfw3.lib;glfw3dll.lib;opengl32.lib;glew32s.lib;tbb.lib;tbb_debug.lib;tbb12.lib;tbb12_debug.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>$(SolutionDir)\Dependencies\GLEW\lib\Release\x64;$(solutionDir)Dependencies\GLFW\lib-vc2022;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>glfw3.lib;glfw3dll.lib;opengl32.lib;glew32s.lib;tbb.lib;tbb_debug.lib;tbb12.lib;tbb12_debug.lib;OpenCL.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(SolutionDir)\Dependencies\GLEW\lib\Release\x64;$(solutionDir)Dependencies\GLFW\lib-vc2022;$(MSBuildProgramFiles32)\Intel\oneAPI\compiler\latest\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalOptions>/NODEFAULTLIB:LIBCMT
  %(AdditionalOptions)</AdditionalOptions>
     </Link>
@@ -163,8 +163,8 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>glfw3.lib;glfw3dll.lib;opengl32.lib;glew32s.lib;tbb.lib;tbb_debug.lib;tbb12.lib;tbb12_debug.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>$(SolutionDir)\Dependencies\GLEW\lib\Release\x64;$(solutionDir)Dependencies\GLFW\lib-vc2022;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>glfw3.lib;glfw3dll.lib;opengl32.lib;glew32s.lib;tbb.lib;tbb_debug.lib;tbb12.lib;tbb12_debug.lib;OpenCL.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(SolutionDir)\Dependencies\GLEW\lib\Release\x64;$(solutionDir)Dependencies\GLFW\lib-vc2022;$(MSBuildProgramFiles32)\Intel\oneAPI\compiler\latest\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalOptions>/NODEFAULTLIB:LIBCMT
  %(AdditionalOptions)</AdditionalOptions>
     </Link>

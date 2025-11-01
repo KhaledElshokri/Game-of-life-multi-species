@@ -1,15 +1,15 @@
+#include <windows.h>
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
-#include <atomic>
+
+#include <CL/cl.h>
+#include <CL/cl_gl.h>
+
 #include <chrono>
-#include <condition_variable>
+#include <cstdint>
 #include <iostream>
-#include <mutex>
 #include <random>
-#include <thread>
 #include <vector>
-#include <tbb/parallel_for.h>
-#include <tbb/blocked_range2d.h>
 
 // Window / grid size
 const int WIN_W = 1024;
@@ -17,132 +17,41 @@ const int WIN_H = 768;
 const int GRID_W = WIN_W;
 const int GRID_H = WIN_H;
 
-// Number of species (5..10 typical)
-const int NUM_SPECIES = 10;
+// Random number of species (5..10)
+std::mt19937 rng_num_spec((unsigned)std::chrono::steady_clock::now().time_since_epoch().count());
+std::uniform_int_distribution<int> d_spec(5, 10);
+const int NUM_SPECIES = (uint8_t)d_spec(rng_num_spec);
 
 // Colors for species (RGB each 0-255) - index 0 reserved for dead
 const uint8_t SPECIES_COLORS[11][3] = {
-    {0, 0, 0},        // 0 dead: black
-    {255, 0, 0},      // species 1: red
-    {0, 255, 0},      // species 2: green
-    {0, 0, 255},      // species 3: blue
-    {255, 255, 0},    // species 4: yellow
-    {255, 0, 255},    // species 5: magenta
-    {0, 255, 255},    // species 6: cyan
-    {255, 165, 0},    // species 7: orange
-    {128, 0, 128},    // species 8: purple
-    {192, 192, 192},  // species 9: light gray
-    {255, 255, 255}   // species 10: white
+    {0, 0, 0},        // dead
+    {255, 0, 0},      // species1
+    {0, 255, 0},      // species2
+    {0, 0, 255},      // species3
+    {255, 255, 0},    // species4
+    {255, 0, 255},    // species5
+    {0, 255, 255},    // species6
+    {255, 165, 0},    // species7
+    {128, 0, 128},    // species8
+    {192, 192, 192},  // species9
+    {255, 255, 255}   // species10
 };
 
-// index in 1D vector for (x,y)
 inline int idx(int x, int y) { return y * GRID_W + x; }
 
-// Shared state
-std::vector<uint8_t> grid_cur(GRID_W* GRID_H);   // species id per cell
-std::vector<uint8_t> grid_next(GRID_W* GRID_H);  // next generation
-std::vector<uint8_t> pixels_curr(GRID_W* GRID_H * 3); // RGB pixel buffer for texture
-std::vector<uint8_t> pixels_next(GRID_W* GRID_H * 3); // RGB pixel buffer for texture
-std::vector<std::vector<uint8_t>> neighbor_counts(NUM_SPECIES + 1); // per-species neighbor counts
+// CPU-side buffers
+std::vector<uint8_t> grid_cur(GRID_W* GRID_H);
+std::vector<uint8_t> pixels_cpu(GRID_W* GRID_H * 3);
 
-
-// Precompute neighbor counts for all species
-void compute_all_neighbor_counts_tbb(const std::vector<uint8_t>& grid) {
-  for (uint8_t s = 1; s <= NUM_SPECIES; ++s)
-    neighbor_counts[s].assign(GRID_W * GRID_H, 0);
-
-  tbb::task_group tg;
-  for (uint8_t s = 1; s <= NUM_SPECIES; ++s) {
-    tg.run([&, s] {
-      auto& nc = neighbor_counts[s];
-      tbb::parallel_for(tbb::blocked_range2d<int>(0, GRID_H, 64, 0, GRID_W, 64),
-        [&](const tbb::blocked_range2d<int>& r) {
-          for (int y = r.rows().begin(); y < r.rows().end(); ++y) {
-            int row = y * GRID_W;
-            for (int x = r.cols().begin(); x < r.cols().end(); ++x) {
-              if (grid[row + x] != s) continue;
-              int y0 = std::max(0, y - 1);
-              int y1 = std::min(GRID_H - 1, y + 1);
-              int x0 = std::max(0, x - 1);
-              int x1 = std::min(GRID_W - 1, x + 1);
-              for (int yy = y0; yy <= y1; ++yy) {
-                int row2 = yy * GRID_W;
-                for (int xx = x0; xx <= x1; ++xx) {
-                  if (xx == x && yy == y) continue;
-                  ++nc[row2 + xx];
-                }
-              }
-            }
-          }
-        });
-      });
-  }
-  tg.wait(); // Wait for all species computations
-}
-
-// Parallel compute of next generation
-void compute_next_generation_tbb() {
-
-  tbb::parallel_for(
-    tbb::blocked_range2d<int>(0, GRID_H, 32, 0, GRID_W, 64),
-    [&](const tbb::blocked_range2d<int>& r) {
-
-      std::mt19937 rng(std::random_device{}());
-
-      for (int y = r.rows().begin(); y < r.rows().end(); ++y) {
-        for (int x = r.cols().begin(); x < r.cols().end(); ++x) {
-          int index = idx(x, y);
-          uint8_t final_species = 0;
-          int best_score = -1000;
-          uint8_t cur = grid_cur[index];
-
-          std::vector<uint8_t> alive_candidates;
-          alive_candidates.reserve(NUM_SPECIES);
-
-          for (uint8_t s = 1; s <= NUM_SPECIES; ++s) {
-            int neighbors = neighbor_counts[s][index];
-            bool cur_alive = (cur == s);
-            bool next_alive = false;
-
-            // Apply Game of Life rules
-            if (cur_alive) {
-              next_alive = (neighbors == 2 || neighbors == 3);
-            }
-            else {
-              next_alive = (neighbors == 3);
-            }
-
-            if (next_alive)
-              alive_candidates.push_back(s);
-          }
-
-          if (!alive_candidates.empty()) {
-            std::uniform_int_distribution<size_t> dist(0, alive_candidates.size() - 1);
-            final_species = alive_candidates[dist(rng)];
-          }
-
-          // Write to next grid and pixel buffer
-          grid_next[index] = final_species;
-
-          const uint8_t* color = SPECIES_COLORS[final_species];
-          uint8_t* dst = &pixels_next[index * 3];
-          dst[0] = color[0];
-          dst[1] = color[1];
-          dst[2] = color[2];
-        }
-      }
-    });
-}
-
-// Tiny vertex & fragment shader to draw textured quad
+// Shader sources
 const char* vshader_src = R"(
 #version 330 core
-layout(location = 0) in vec2 aPos;
-layout(location = 1) in vec2 aUV;
+layout(location=0) in vec2 aPos;
+layout(location=1) in vec2 aUV;
 out vec2 vUV;
-void main() {
+void main(){
     vUV = aUV;
-    gl_Position = vec4(aPos, 0.0, 1.0);
+    gl_Position = vec4(aPos,0.0,1.0);
 }
 )";
 const char* fshader_src = R"(
@@ -150,159 +59,346 @@ const char* fshader_src = R"(
 in vec2 vUV;
 out vec4 FragColor;
 uniform sampler2D uTex;
-void main() {
+void main(){
     FragColor = texture(uTex, vUV);
 }
 )";
 
-GLuint compile_shader(GLenum type, const char* src) {
-  GLuint s = glCreateShader(type);
-  glShaderSource(s, 1, &src, NULL);
-  glCompileShader(s);
-  GLint ok;
-  glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
-  if (!ok) {
-    char buf[1024]; glGetShaderInfoLog(s, 1024, NULL, buf);
-    std::cerr << "Shader compile error: " << buf << std::endl;
-  }
-  return s;
+// OpenCL kernel source
+const char* cl_kernel_src = R"CLC(
+__constant sampler_t smp = CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_CLAMP | CLK_FILTER_NEAREST;
+
+inline uint lcg_rand_uint(uint state) {
+    state = (1103515245u * state + 12345u);
+    return state;
 }
 
-int main() {
+__kernel void gol_kernel(
+    const int width,
+    const int height,
+    const int num_species,
+    const uint frame_seed,
+    __global const uchar* grid_in,
+    __global uchar* rgb_out,
+    __global uchar* grid_out
+){
+    int gx = get_global_id(0);
+    int gy = get_global_id(1);
+    if (gx >= width || gy >= height) return;
+    int index = gy * width + gx;
+    uchar cur = grid_in[index];
 
-  // Init GLFW with core profile 3.3
-  if (!glfwInit()) return -1;
-  glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-  glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
-  glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-  glfwWindowHint(GLFW_DOUBLEBUFFER, GLFW_TRUE);
+    uchar counts[11];
+    for (int i=0;i<=num_species;i++) counts[i] = 0;
 
-  // Window setup
-  GLFWwindow* window = glfwCreateWindow(WIN_W, WIN_H, "Multi-Species Game of Life", NULL, NULL);
-  if (!window) { glfwTerminate(); return -1; }
-  glfwMakeContextCurrent(window);
-  glfwSwapInterval(0);
+    int x0 = (gx>0? gx-1 : 0);
+    int x1 = (gx<width-1? gx+1 : width-1);
+    int y0 = (gy>0? gy-1 : 0);
+    int y1 = (gy<height-1? gy+1 : height-1);
 
-  if (glewInit() != GLEW_OK) {
-    std::cerr << "GLEW init failed\n";
-    return -1;
-  }
-
-  // Setup simple textured quad (full screen)
-  float quadVerts[] = {
-    // positions    // uvs
-    -1.f, -1.f,     0.f, 0.f,
-     1.f, -1.f,     1.f, 0.f,
-     1.f,  1.f,     1.f, 1.f,
-    -1.f,  1.f,     0.f, 1.f
-  };
-  unsigned int quadIdx[] = { 0,1,2, 2,3,0 };
-  GLuint vao, vbo, ebo;
-  glGenVertexArrays(1, &vao);
-  glGenBuffers(1, &vbo);
-  glGenBuffers(1, &ebo);
-  glBindVertexArray(vao);
-  glBindBuffer(GL_ARRAY_BUFFER, vbo);
-  glBufferData(GL_ARRAY_BUFFER, sizeof(quadVerts), quadVerts, GL_STATIC_DRAW);
-  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
-  glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(quadIdx), quadIdx, GL_STATIC_DRAW);
-  glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
-  glEnableVertexAttribArray(0);
-  glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
-  glEnableVertexAttribArray(1);
-  glBindVertexArray(0);
-
-  // Compile shader
-  GLuint vs = compile_shader(GL_VERTEX_SHADER, vshader_src);
-  GLuint fs = compile_shader(GL_FRAGMENT_SHADER, fshader_src);
-  GLuint prog = glCreateProgram();
-  glAttachShader(prog, vs);
-  glAttachShader(prog, fs);
-  glLinkProgram(prog);
-  GLint ok;
-  glGetProgramiv(prog, GL_LINK_STATUS, &ok);
-  if (!ok) {
-    char buf[1024];
-    glGetProgramInfoLog(prog, 1024, NULL, buf);
-    std::cerr << "Program link error: " << buf << std::endl;
-  }
-  glDeleteShader(vs);
-  glDeleteShader(fs);
-
-  // Create texture
-  GLuint tex;
-  glGenTextures(1, &tex);
-  glBindTexture(GL_TEXTURE_2D, tex);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, GRID_W, GRID_H, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
-
-  // Initialize grid randomly
-  std::mt19937 rng((unsigned)std::chrono::steady_clock::now().time_since_epoch().count());
-  std::uniform_int_distribution<int> d(0, NUM_SPECIES);
-  for (int y = 0; y < GRID_H; ++y) {
-    for (int x = 0; x < GRID_W; ++x) {
-      grid_cur[idx(x, y)] = (uint8_t)d(rng);
-      uint8_t s = grid_cur[idx(x, y)];
-      pixels_curr[idx(x, y) * 3 + 0] = SPECIES_COLORS[s][0];
-      pixels_curr[idx(x, y) * 3 + 1] = SPECIES_COLORS[s][1];
-      pixels_curr[idx(x, y) * 3 + 2] = SPECIES_COLORS[s][2];
+    for (int yy=y0; yy<=y1; ++yy) {
+        int row = yy * width;
+        for (int xx=x0; xx<=x1; ++xx) {
+            if (xx==gx && yy==gy) continue;
+            uchar s = grid_in[row + xx];
+            counts[s] = counts[s] + (uchar)1;
+        }
     }
-  }
 
-  // Main loop of the application
-  while (!glfwWindowShouldClose(window)) {
+    uchar candidates[11];
+    uchar cand_cnt = 0;
+    for (int s=1; s<=num_species; ++s) {
+        uchar neighbors = counts[s];
+        uchar cur_alive = (cur == (uchar)s) ? 1 : 0;
+        uchar next_alive = 0;
+        if (cur_alive) {
+            next_alive = (neighbors == 2 || neighbors == 3) ? 1 : 0;
+        } else {
+            next_alive = (neighbors == 3) ? 1 : 0;
+        }
+        if (next_alive) {
+            candidates[cand_cnt++] = (uchar)s;
+        }
+    }
 
-    auto start = std::chrono::high_resolution_clock::now();
+    uchar final_species = 0;
+    if (cand_cnt > 0) {
+        uint state = (uint)(gx * 73856093u ^ gy * 19349663u ^ frame_seed);
+        state = lcg_rand_uint(state);
+        uint pick = state % cand_cnt;
+        final_species = candidates[pick];
+    }
 
-    // Precompute neighbor counts for all species
-    compute_all_neighbor_counts_tbb(grid_cur);
+    // write grid_out
+    grid_out[index] = final_species;
 
-    // Compute next generation in parallel using TBB
-    compute_next_generation_tbb();
+    // write rgb_out
+    const uchar palette[11][3] = {
+        {0,0,0}, {255,0,0}, {0,255,0}, {0,0,255}, {255,255,0},
+        {255,0,255}, {0,255,255}, {255,165,0}, {128,0,128}, {192,192,192}, {255,255,255}
+    };
+    int p = index*3;
+    rgb_out[p+0] = palette[final_species][0];
+    rgb_out[p+1] = palette[final_species][1];
+    rgb_out[p+2] = palette[final_species][2];
+}
+)CLC";
 
-    auto end = std::chrono::high_resolution_clock::now();
+static void check_cl(cl_int err, const char* msg) {
+    if (err != CL_SUCCESS) {
+        std::cerr << "OpenCL Error (" << err << "): " << msg << std::endl;
+        exit(EXIT_FAILURE);
+    }
+}
 
-    // Limit to 30 FPS
-    auto frame_time = end - start;
-    if (frame_time < std::chrono::milliseconds(15)) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(15) - frame_time);
-      end = std::chrono::high_resolution_clock::now();
-		}
+GLuint compile_shader(GLenum type, const char* src) {
+    GLuint s = glCreateShader(type);
+    glShaderSource(s,1,&src,nullptr);
+    glCompileShader(s);
+    GLint ok;
+    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char buf[1024];
+        glGetShaderInfoLog(s, 1024, NULL, buf);
+        std::cerr << "Shader compile error: " << buf << std::endl;
+    }
+    return s;
+}
 
-    std::chrono::duration<double, std::milli> elapsed = end - start;
-    std::cout << "Frame time : " << elapsed.count() << " ms\n";
+int main(){
+    // GLFW + GL init
+    if (!glfwInit()) {
+        std::cerr << "GLFW init failed\n";
+        return -1;
+    }
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    GLFWwindow* window = glfwCreateWindow(WIN_W, WIN_H, "GOL OpenCL Windows Iris Xe", NULL, NULL);
+    if (!window) {
+        std::cerr << "Window creation failed\n";
+        glfwTerminate();
+        return -1;
+    }
+    glfwMakeContextCurrent(window);
+    glfwSwapInterval(0);
+    if (glewInit() != GLEW_OK) {
+        std::cerr << "GLEW init failed\n";
+        return -1;
+    }
 
-    // swap buffers (producer-consumer double buffer)
-    grid_cur.swap(grid_next);
-    pixels_curr.swap(pixels_next);
-
-    // Convert to pixels (colors) and upload texture
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, GRID_W, GRID_H, GL_RGB, GL_UNSIGNED_BYTE, pixels_curr.data());
-
-    // Draw textured quad full-screen
-    glClear(GL_COLOR_BUFFER_BIT);
-    glUseProgram(prog);
+    // Setup quad
+    float quadVerts[] = {
+        -1.f,-1.f, 0.f,0.f,
+         1.f,-1.f, 1.f,0.f,
+         1.f, 1.f, 1.f,1.f,
+        -1.f, 1.f, 0.f,1.f
+    };
+    unsigned int quadIdx[] = {0,1,2,2,3,0};
+    GLuint vao, vbo, ebo;
+    glGenVertexArrays(1,&vao);
+    glGenBuffers(1,&vbo);
+    glGenBuffers(1,&ebo);
     glBindVertexArray(vao);
-    // Texture unit 0
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quadVerts), quadVerts, GL_STATIC_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(quadIdx), quadIdx, GL_STATIC_DRAW);
+    glVertexAttribPointer(0,2,GL_FLOAT,GL_FALSE,4*sizeof(float),(void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1,2,GL_FLOAT,GL_FALSE,4*sizeof(float),(void*)(2*sizeof(float)));
+    glEnableVertexAttribArray(1);
+    glBindVertexArray(0);
 
-    glfwSwapBuffers(window);
-    glfwPollEvents();
+    // Compile GL shader
+    GLuint vs = compile_shader(GL_VERTEX_SHADER, vshader_src);
+    GLuint fs = compile_shader(GL_FRAGMENT_SHADER, fshader_src);
+    GLuint prog = glCreateProgram();
+    glAttachShader(prog, vs);
+    glAttachShader(prog, fs);
+    glLinkProgram(prog);
+    {
+        GLint ok2; glGetProgramiv(prog, GL_LINK_STATUS, &ok2);
+        if (!ok2) {
+            char buf[1024]; glGetProgramInfoLog(prog,1024,NULL,buf);
+            std::cerr<<"Link error: "<<buf<<"\n";
+        }
+    }
+    glDeleteShader(vs); glDeleteShader(fs);
 
-  }
+    // Create texture
+    GLuint tex;
+    glGenTextures(1,&tex);
+    glBindTexture(GL_TEXTURE_2D,tex);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+    // allocate RGBA8
+    glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,GRID_W,GRID_H,0,GL_RGBA,GL_UNSIGNED_BYTE,nullptr);
 
-  // Cleanup GL
-  glDeleteTextures(1, &tex);
-  glDeleteProgram(prog);
-  glDeleteBuffers(1, &vbo);
-  glDeleteBuffers(1, &ebo);
-  glDeleteVertexArrays(1, &vao);
+    // Initialize grid randomly
+    std::mt19937 rng((unsigned)std::chrono::steady_clock::now().time_since_epoch().count());
+    std::uniform_int_distribution<int> d(0,NUM_SPECIES);
+    for(int y=0;y<GRID_H;++y){
+        for(int x=0;x<GRID_W;++x){
+            grid_cur[idx(x,y)] = (uint8_t)d(rng);
+            uint8_t s = grid_cur[idx(x,y)];
+            pixels_cpu[idx(x,y)*3+0] = SPECIES_COLORS[s][0];
+            pixels_cpu[idx(x,y)*3+1] = SPECIES_COLORS[s][1];
+            pixels_cpu[idx(x,y)*3+2] = SPECIES_COLORS[s][2];
+        }
+    }
 
-  glfwDestroyWindow(window);
-  glfwTerminate();
-  return 0;
+    // -------- OpenCL setup --------
+    cl_int clerr;
+    cl_platform_id platform = nullptr;
+    cl_uint num_plat=0;
+    clerr = clGetPlatformIDs(1, &platform, &num_plat);
+    check_cl(clerr, "clGetPlatformIDs");
+
+    // find GPU device (Intel Iris Xe)
+    cl_device_id device = nullptr;
+    cl_uint num_dev=0;
+    clerr = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &device, &num_dev);
+    if (clerr != CL_SUCCESS) {
+        clerr = clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL,1,&device,&num_dev);
+        check_cl(clerr, "clGetDeviceIDs fallback");
+    }
+
+    // Prepare context properties for WGL sharing
+    cl_context_properties props[] = {
+        CL_CONTEXT_PLATFORM, (cl_context_properties)platform,
+        CL_GL_CONTEXT_KHR, (cl_context_properties)wglGetCurrentContext(),
+        CL_WGL_HDC_KHR,     (cl_context_properties)wglGetCurrentDC(),
+        0
+    };
+
+    cl_context clContext = clCreateContext(props, 1, &device, NULL, NULL, &clerr);
+    if (clerr != CL_SUCCESS) {
+        // fallback: create normal context
+        clContext = clCreateContext(NULL,1,&device,NULL,NULL,&clerr);
+        check_cl(clerr, "clCreateContext fallback");
+    }
+
+    const cl_queue_properties properties[] = {
+    CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE, // enable profiling if needed
+    0 // terminator
+    };
+
+    cl_command_queue clQueue = clCreateCommandQueueWithProperties(clContext, device, properties, &clerr);
+    check_cl(clerr, "clCreateCommandQueueWithProperties");
+
+    // Build program
+    const char* src_ptr = cl_kernel_src;
+    cl_program program = clCreateProgramWithSource(clContext,1,&src_ptr,nullptr,&clerr);
+    check_cl(clerr, "clCreateProgramWithSource");
+    clerr = clBuildProgram(program,1,&device,NULL,NULL,NULL);
+    if (clerr != CL_SUCCESS) {
+        size_t logsz=0;
+        clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, NULL, &logsz);
+        std::vector<char> log(logsz+1);
+        clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, logsz, log.data(), NULL);
+        std::cerr<<"Build log:\n"<<log.data()<<"\n";
+        check_cl(clerr, "clBuildProgram");
+    }
+
+    cl_kernel kernel = clCreateKernel(program, "gol_kernel", &clerr);
+    check_cl(clerr, "clCreateKernel");
+
+    // Create buffers
+    cl_mem d_grid_in  = clCreateBuffer(clContext, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(uint8_t)*grid_cur.size(), grid_cur.data(), &clerr);
+    check_cl(clerr, "clCreateBuffer grid_in");
+
+    cl_mem d_grid_out = clCreateBuffer(clContext, CL_MEM_READ_WRITE, sizeof(uint8_t)*grid_cur.size(), nullptr, &clerr);
+    check_cl(clerr, "clCreateBuffer grid_out");
+
+    cl_mem d_rgb_out  = clCreateBuffer(clContext, CL_MEM_WRITE_ONLY, sizeof(uint8_t)*GRID_W*GRID_H*3, nullptr, &clerr);
+    check_cl(clerr, "clCreateBuffer rgb_out");
+
+    // Set kernel constant args (width, height, species)
+    check_cl(clSetKernelArg(kernel, 0, sizeof(int), &GRID_W), "clSetKernelArg 0");
+    check_cl(clSetKernelArg(kernel, 1, sizeof(int), &GRID_H), "clSetKernelArg 1");
+    check_cl(clSetKernelArg(kernel, 2, sizeof(int), &NUM_SPECIES), "clSetKernelArg 2");
+
+    // GL shader uniform
+    glUseProgram(prog);
+    glUniform1i(glGetUniformLocation(prog, "uTex"), 0);
+
+    // Main loop
+    uint32_t frame = 1;
+    while (!glfwWindowShouldClose(window)) {
+        auto t0 = std::chrono::high_resolution_clock::now();
+
+        // Write current grid to device
+        check_cl(clEnqueueWriteBuffer(clQueue, d_grid_in, CL_TRUE, 0,
+               sizeof(uint8_t)*grid_cur.size(), grid_cur.data(), 0, NULL, NULL),
+               "clEnqueueWriteBuffer grid_in");
+
+        // Set per-frame args: frame seed, grid_in/out, rgb_out
+        uint32_t frame_seed = frame * 1640531527u + 123456789u;
+        check_cl(clSetKernelArg(kernel, 3, sizeof(uint32_t), &frame_seed), "clSetKernelArg 3");
+        check_cl(clSetKernelArg(kernel, 4, sizeof(cl_mem), &d_grid_in), "clSetKernelArg 4");
+        check_cl(clSetKernelArg(kernel, 5, sizeof(cl_mem), &d_rgb_out), "clSetKernelArg 5");
+        check_cl(clSetKernelArg(kernel, 6, sizeof(cl_mem), &d_grid_out), "clSetKernelArg 6");
+
+        size_t gws[2] = { (size_t)GRID_W, (size_t)GRID_H };
+        size_t lws[2] = { 16, 16 }; // tuneable for Intel Iris Xe
+        check_cl(clEnqueueNDRangeKernel(clQueue, kernel, 2, NULL, gws, lws, 0, NULL, NULL), "clEnqueueNDRangeKernel");
+
+        clFinish(clQueue);
+
+        // Read back rgb_out to host
+        check_cl(clEnqueueReadBuffer(clQueue, d_rgb_out, CL_TRUE, 0,
+               sizeof(uint8_t)*GRID_W*GRID_H*3, pixels_cpu.data(), 0, NULL, NULL), "clEnqueueReadBuffer rgb_out");
+
+        // Upload to GL texture (RGBA8 but we only filled RGB bytes; we'll set A=255 via GL)
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexSubImage2D(GL_TEXTURE_2D,0,0,0,GRID_W,GRID_H,GL_RGB,GL_UNSIGNED_BYTE,pixels_cpu.data());
+
+        // Swap grid buffers on host: copy grid_out -> grid_cur
+        std::vector<uint8_t> next_grid(GRID_W*GRID_H);
+        check_cl(clEnqueueReadBuffer(clQueue, d_grid_out, CL_TRUE, 0,
+               sizeof(uint8_t)*next_grid.size(), next_grid.data(), 0, NULL, NULL),
+               "clEnqueueReadBuffer grid_out");
+        grid_cur.swap(next_grid);
+
+        // Render
+        glClear(GL_COLOR_BUFFER_BIT);
+        glUseProgram(prog);
+        glBindVertexArray(vao);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glDrawElements(GL_TRIANGLES,6,GL_UNSIGNED_INT,0);
+
+        glfwSwapBuffers(window);
+        glfwPollEvents();
+
+        if (glfwGetKey(window, GLFW_KEY_ESCAPE)==GLFW_PRESS) break;
+
+        ++frame;
+        auto t1 = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double, std::milli> elapsed = t1 - t0;
+        double fps = 1000.0 / (elapsed.count() + 1e-6);
+        if ((frame & 31)==0) {
+            std::cout<<"frame "<<frame<<" fps ~ "<<fps<<" num_species="<<NUM_SPECIES<<"\n";
+        }
+    }
+
+    // Clean up
+    clReleaseMemObject(d_grid_in);
+    clReleaseMemObject(d_grid_out);
+    clReleaseMemObject(d_rgb_out);
+    clReleaseKernel(kernel);
+    clReleaseProgram(program);
+    clReleaseCommandQueue(clQueue);
+    clReleaseContext(clContext);
+
+    glDeleteTextures(1,&tex);
+    glDeleteProgram(prog);
+    glDeleteBuffers(1,&vbo);
+    glDeleteBuffers(1,&ebo);
+    glDeleteVertexArrays(1,&vao);
+    glfwDestroyWindow(window);
+    glfwTerminate();
+
+    return 0;
 }
