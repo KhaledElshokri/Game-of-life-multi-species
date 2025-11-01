@@ -377,6 +377,12 @@ int main(){
         ++frame;
         auto t1 = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double, std::milli> elapsed = t1 - t0;
+        // Limit to 30 FPS
+        if (elapsed.count() < (1000.0 / 30.0)) {
+	        Sleep((DWORD)((1000.0 / 31.0) - elapsed.count()));
+	        t1 = std::chrono::high_resolution_clock::now();
+	        elapsed = t1 - t0;
+        }
         double fps = 1000.0 / (elapsed.count() + 1e-6);
         if ((frame & 31)==0) {
             std::cout<<"frame "<<frame<<" fps ~ "<<fps<<" num_species="<<NUM_SPECIES<<"\n";
